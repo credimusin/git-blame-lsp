@@ -15,7 +15,7 @@ pub const GitRunner = struct {
             .argv = argv,
             .cwd = if (cwd) |c| .{ .path = c } else .inherit,
             .stdout = .pipe,
-            .stderr = .pipe,
+            .stderr = .ignore,
         }) catch return null;
 
         var stdout_list: std.ArrayList(u8) = .empty;
@@ -75,6 +75,12 @@ pub fn urlDecode(allocator: Allocator, uri: []const u8) ![]const u8 {
         }
     }
 
+    if (result.items.len >= 3 and result.items[0] == '/' and std.ascii.isAlphabetic(result.items[1]) and result.items[2] == ':') {
+        const owned = try result.toOwnedSlice(allocator);
+        defer allocator.free(owned);
+        return try allocator.dupe(u8, owned[1..]);
+    }
+
     return try result.toOwnedSlice(allocator);
 }
 
@@ -88,7 +94,9 @@ pub fn cleanSummary(allocator: Allocator, text: []const u8) ![]const u8 {
 }
 
 pub fn dedentDiff(allocator: Allocator, lines: []const []const u8) ![]const []const u8 {
-    if (lines.len == 0) return lines;
+    if (lines.len == 0) {
+        return try allocator.alloc([]const u8, 0);
+    }
 
     var min_indent: usize = 9999;
     var found_indent = false;
@@ -110,7 +118,10 @@ pub fn dedentDiff(allocator: Allocator, lines: []const []const u8) ![]const []co
     if (!found_indent) min_indent = 0;
 
     var result: std.ArrayList([]const u8) = .empty;
-    errdefer result.deinit(allocator);
+    errdefer {
+        for (result.items) |item| allocator.free(item);
+        result.deinit(allocator);
+    }
 
     for (lines) |line| {
         if (line.len > 1 and (line[0] == '+' or line[0] == '-')) {
@@ -141,7 +152,8 @@ pub const Hunk = struct {
 };
 
 pub fn getHunkDiff(allocator: Allocator, runner: *const GitRunner, file_path: []const u8, dir_path: []const u8, target_line: usize) !?[]const u8 {
-    const raw_diff = try runner.run(&.{ "git", "diff", "-U0", "--no-color", file_path }, dir_path) orelse return null;
+    const raw_diff = (try runner.run(&.{ "git", "diff", "HEAD", "-U0", "--no-color", file_path }, dir_path)) orelse
+        (try runner.run(&.{ "git", "diff", "-U0", "--no-color", file_path }, dir_path)) orelse return null;
     defer allocator.free(raw_diff);
 
     var hunks: std.ArrayList(Hunk) = .empty;
@@ -154,7 +166,7 @@ pub fn getHunkDiff(allocator: Allocator, runner: *const GitRunner, file_path: []
     }
 
     var lines_it = std.mem.splitScalar(u8, raw_diff, '\n');
-    var current_hunk: ?*Hunk = null;
+    var current_hunk_idx: ?usize = null;
 
     while (lines_it.next()) |line| {
         if (std.mem.startsWith(u8, line, "@@ ")) {
@@ -192,10 +204,10 @@ pub fn getHunkDiff(allocator: Allocator, runner: *const GitRunner, file_path: []
                 .new_count = new_count,
                 .diff_lines = .empty,
             });
-            current_hunk = &hunks.items[hunks.items.len - 1];
-        } else if (current_hunk) |hunk| {
+            current_hunk_idx = hunks.items.len - 1;
+        } else if (current_hunk_idx) |idx| {
             if (line.len > 0 and (line[0] == '+' or line[0] == '-')) {
-                try hunk.diff_lines.append(allocator, try allocator.dupe(u8, line));
+                try hunks.items[idx].diff_lines.append(allocator, try allocator.dupe(u8, line));
             }
         }
     }
@@ -205,7 +217,7 @@ pub fn getHunkDiff(allocator: Allocator, runner: *const GitRunner, file_path: []
         const n_count = hunk.new_count;
         const n_end = if (n_count > 0) n_start + n_count - 1 else n_start;
 
-        if ((n_count == 0 and target_line == n_start) or (target_line >= n_start and target_line <= n_end)) {
+        if ((n_count == 0 and target_line == n_start) or (n_count > 0 and target_line >= n_start and target_line <= n_end)) {
             const dedented = try dedentDiff(allocator, hunk.diff_lines.items);
             defer {
                 for (dedented) |d| allocator.free(d);
@@ -235,6 +247,7 @@ pub fn getHunkDiff(allocator: Allocator, runner: *const GitRunner, file_path: []
 
 pub fn getStatusAndStats(allocator: Allocator, runner: *const GitRunner, file_path: []const u8, dir_path: []const u8) ![]const u8 {
     const fname = std.fs.path.basename(file_path);
+    var status_buf: [4]u8 = undefined;
     var status_code: []const u8 = "M";
     var added: usize = 0;
     var deleted: usize = 0;
@@ -243,12 +256,17 @@ pub fn getStatusAndStats(allocator: Allocator, runner: *const GitRunner, file_pa
         defer allocator.free(st);
         const trimmed = std.mem.trim(u8, st, " \t\r\n");
         if (trimmed.len >= 1) {
-            status_code = try allocator.dupe(u8, trimmed[0..@min(2, trimmed.len)]);
-            status_code = std.mem.trim(u8, status_code, " ");
+            const code_slice = std.mem.trim(u8, trimmed[0..@min(2, trimmed.len)], " ");
+            const len = @min(code_slice.len, status_buf.len);
+            @memcpy(status_buf[0..len], code_slice[0..len]);
+            status_code = status_buf[0..len];
         }
     }
 
-    if (try runner.run(&.{ "git", "diff", "--numstat", file_path }, dir_path)) |numstat| {
+    const numstat_raw = (try runner.run(&.{ "git", "diff", "HEAD", "--numstat", file_path }, dir_path)) orelse
+        (try runner.run(&.{ "git", "diff", "--numstat", file_path }, dir_path));
+
+    if (numstat_raw) |numstat| {
         defer allocator.free(numstat);
         var parts = std.mem.splitScalar(u8, std.mem.trim(u8, numstat, " \t\r\n"), '\t');
         if (parts.next()) |a_str| {
@@ -276,6 +294,7 @@ pub fn getGitBlameAndDiff(allocator: Allocator, runner: *const GitRunner, file_p
 
     var sha: []const u8 = "";
     var author: []const u8 = "";
+    var date_buf: [16]u8 = undefined;
     var author_time: []const u8 = "";
     var summary: []const u8 = "";
     var prev_sha: []const u8 = "";
@@ -298,11 +317,11 @@ pub fn getGitBlameAndDiff(allocator: Allocator, runner: *const GitRunner, file_p
                     const epoch_day = epoch_seconds.getEpochDay();
                     const year_day = epoch_day.calculateYearDay();
                     const month_day = year_day.calculateMonthDay();
-                    author_time = try std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+                    author_time = std.fmt.bufPrint(&date_buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
                         year_day.year,
                         month_day.month.numeric(),
                         month_day.day_index + 1,
-                    });
+                    }) catch "";
                 }
             } else if (std.mem.startsWith(u8, line, "summary ")) {
                 summary = std.mem.trim(u8, line[8..], " \t\r\n");
@@ -319,13 +338,6 @@ pub fn getGitBlameAndDiff(allocator: Allocator, runner: *const GitRunner, file_p
     var result_list: std.ArrayList(u8) = .empty;
     errdefer result_list.deinit(allocator);
 
-    // 1. Diff preview block
-    if (hunk_diff) |hd| {
-        try result_list.appendSlice(allocator, hd);
-        try result_list.append(allocator, '\n');
-    }
-
-    // 2. Metadata / Blame line
     const is_uncommitted = std.mem.startsWith(u8, sha, "0000000") or std.mem.eql(u8, author, "Not Committed Yet");
 
     if (is_uncommitted) {
@@ -334,16 +346,21 @@ pub fn getGitBlameAndDiff(allocator: Allocator, runner: *const GitRunner, file_p
 
         try result_list.appendSlice(allocator, "`");
         try result_list.appendSlice(allocator, file_stat);
-        try result_list.appendSlice(allocator, "`\n\n");
+        try result_list.appendSlice(allocator, "`\n");
+
+        if (hunk_diff) |hd| {
+            try result_list.appendSlice(allocator, hd);
+            try result_list.appendSlice(allocator, "\n");
+        }
 
         if (prev_sha.len > 0) {
-            const prev_out = try runner.run(&.{ "git", "show", "-s", "--format=%an|%ar|%s", prev_sha }, dir_path);
+            const prev_out = try runner.run(&.{ "git", "show", "-s", "--format=%an%x00%ar%x00%s", prev_sha }, dir_path);
             if (prev_out) |po| {
                 defer allocator.free(po);
-                var parts = std.mem.splitScalar(u8, std.mem.trim(u8, po, " \t\r\n"), '|');
+                var parts = std.mem.splitScalar(u8, std.mem.trim(u8, po, " \t\r\n"), 0);
                 const p_author = parts.next() orelse "";
                 const p_time = parts.next() orelse "";
-                const p_raw_sum = parts.next() orelse "";
+                const p_raw_sum = parts.rest();
                 const p_sum = try cleanSummary(allocator, p_raw_sum);
                 defer allocator.free(p_sum);
 
@@ -352,12 +369,18 @@ pub fn getGitBlameAndDiff(allocator: Allocator, runner: *const GitRunner, file_p
                 try result_list.appendSlice(allocator, prev_str);
 
                 if (p_sum.len > 0) {
-                    try result_list.appendSlice(allocator, "\n> ");
+                    try result_list.appendSlice(allocator, "  \n  ↳ *");
                     try result_list.appendSlice(allocator, p_sum);
+                    try result_list.appendSlice(allocator, "*");
                 }
             }
         }
     } else if (sha.len > 0) {
+        if (hunk_diff) |hd| {
+            try result_list.appendSlice(allocator, hd);
+            try result_list.appendSlice(allocator, "\n");
+        }
+
         try result_list.appendSlice(allocator, "`Blame: ");
         try result_list.appendSlice(allocator, sha);
         try result_list.appendSlice(allocator, " • ");
@@ -371,11 +394,69 @@ pub fn getGitBlameAndDiff(allocator: Allocator, runner: *const GitRunner, file_p
         const clean_sum = try cleanSummary(allocator, summary);
         defer allocator.free(clean_sum);
         if (clean_sum.len > 0) {
-            try result_list.appendSlice(allocator, "\n> ");
+            try result_list.appendSlice(allocator, "  \n  ↳ *");
             try result_list.appendSlice(allocator, clean_sum);
+            try result_list.appendSlice(allocator, "*");
         }
     }
 
     if (result_list.items.len == 0) return null;
     return try result_list.toOwnedSlice(allocator);
+}
+
+test "urlDecode Unix and Windows paths" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const unix_path = try urlDecode(allocator, "file:///home/user/project/file.zig");
+    defer allocator.free(unix_path);
+    try testing.expectEqualStrings("/home/user/project/file.zig", unix_path);
+
+    const space_path = try urlDecode(allocator, "file:///my%20folder/test%20file.zig");
+    defer allocator.free(space_path);
+    try testing.expectEqualStrings("/my folder/test file.zig", space_path);
+
+    const win_path = try urlDecode(allocator, "file:///C:/Users/Developer/main.zig");
+    defer allocator.free(win_path);
+    try testing.expectEqualStrings("C:/Users/Developer/main.zig", win_path);
+}
+
+test "cleanSummary PR and normal messages" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const pr_msg = try cleanSummary(allocator, "Merge pull request #12 from branch");
+    defer allocator.free(pr_msg);
+    try testing.expectEqualStrings("PR #12 from branch", pr_msg);
+
+    const normal_msg = try cleanSummary(allocator, "  Fix issue with LSP hover  \n");
+    defer allocator.free(normal_msg);
+    try testing.expectEqualStrings("Fix issue with LSP hover", normal_msg);
+}
+
+test "dedentDiff indentation and empty lines" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const empty = try dedentDiff(allocator, &.{});
+    defer allocator.free(empty);
+    try testing.expectEqual(0, empty.len);
+
+    const input = [_][]const u8{
+        "-    pub fn oldFn() void {",
+        "+    pub fn newFn() void {",
+        "+        doSomething();",
+        "+    }",
+    };
+    const dedented = try dedentDiff(allocator, &input);
+    defer {
+        for (dedented) |d| allocator.free(d);
+        allocator.free(dedented);
+    }
+
+    try testing.expectEqual(4, dedented.len);
+    try testing.expectEqualStrings("- pub fn oldFn() void {", dedented[0]);
+    try testing.expectEqualStrings("+ pub fn newFn() void {", dedented[1]);
+    try testing.expectEqualStrings("+     doSomething();", dedented[2]);
+    try testing.expectEqualStrings("+ }", dedented[3]);
 }

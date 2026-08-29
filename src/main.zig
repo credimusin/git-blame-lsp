@@ -4,7 +4,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const File = std.Io.File;
 
-const MessageReader = struct {
+pub const MessageReader = struct {
     file: File,
     io: Io,
     buf: [128 * 1024]u8 = undefined,
@@ -86,9 +86,11 @@ fn sendResponse(io: Io, stdout: File, allocator: Allocator, response_json: []con
     try stdout.writeStreamingAll(io, response_json);
 }
 
-fn jsonEscape(allocator: Allocator, text: []const u8) ![]const u8 {
+pub fn jsonEscape(allocator: Allocator, text: []const u8) ![]const u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(allocator);
+
+    const hex_digits = "0123456789abcdef";
 
     for (text) |c| {
         switch (c) {
@@ -97,13 +99,22 @@ fn jsonEscape(allocator: Allocator, text: []const u8) ![]const u8 {
             '\n' => try list.appendSlice(allocator, "\\n"),
             '\r' => try list.appendSlice(allocator, "\\r"),
             '\t' => try list.appendSlice(allocator, "\\t"),
-            else => try list.append(allocator, c),
+            0x08 => try list.appendSlice(allocator, "\\b"),
+            0x0C => try list.appendSlice(allocator, "\\f"),
+            else => {
+                if (c < 0x20) {
+                    const esc = [_]u8{ '\\', 'u', '0', '0', hex_digits[c >> 4], hex_digits[c & 0x0F] };
+                    try list.appendSlice(allocator, &esc);
+                } else {
+                    try list.append(allocator, c);
+                }
+            },
         }
     }
     return try list.toOwnedSlice(allocator);
 }
 
-fn idToString(allocator: Allocator, id_val: std.json.Value) ![]const u8 {
+pub fn idToString(allocator: Allocator, id_val: std.json.Value) ![]const u8 {
     switch (id_val) {
         .integer => |i| return try std.fmt.allocPrint(allocator, "{d}", .{i}),
         .string => |s| {
@@ -147,7 +158,7 @@ pub fn main(init: std.process.Init) !void {
                 if (std.mem.eql(u8, method, "initialize")) {
                     if (id_val) |id| {
                         const id_str = try idToString(arena_alloc, id);
-                        const resp = try std.fmt.allocPrint(arena_alloc, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"capabilities\":{{\"textDocumentSync\":1,\"hoverProvider\":true}}}}}}", .{id_str});
+                        const resp = try std.fmt.allocPrint(arena_alloc, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"capabilities\":{{\"textDocumentSync\":0,\"hoverProvider\":true}}}}}}", .{id_str});
                         try sendResponse(io, stdout, arena_alloc, resp);
                     }
                 } else if (std.mem.eql(u8, method, "textDocument/hover")) {
@@ -164,10 +175,12 @@ pub fn main(init: std.process.Init) !void {
                                     const line_num = pos_val.?.object.get("line");
 
                                     if (raw_uri != null and raw_uri.? == .string and line_num != null and line_num.? == .integer) {
-                                        const decoded_path = try git.urlDecode(arena_alloc, raw_uri.?.string);
-                                        const line_1based: usize = @intCast(line_num.?.integer + 1);
-
-                                        hover_text = try git.getGitBlameAndDiff(arena_alloc, &git_runner, decoded_path, line_1based);
+                                        const line_int = line_num.?.integer;
+                                        if (line_int >= 0) {
+                                            const decoded_path = try git.urlDecode(arena_alloc, raw_uri.?.string);
+                                            const line_1based: usize = @intCast(line_int + 1);
+                                            hover_text = try git.getGitBlameAndDiff(arena_alloc, &git_runner, decoded_path, line_1based);
+                                        }
                                     }
                                 }
                             }
@@ -192,13 +205,42 @@ pub fn main(init: std.process.Init) !void {
                 } else if (std.mem.eql(u8, method, "exit")) {
                     break;
                 } else {
+                    // Unknown method request: return standard JSON-RPC 2.0 Method Not Found error (-32601)
                     if (id_val) |id| {
                         const id_str = try idToString(arena_alloc, id);
-                        const resp = try std.fmt.allocPrint(arena_alloc, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":null}}", .{id_str});
+                        const resp = try std.fmt.allocPrint(arena_alloc, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"error\":{{\"code\":-32601,\"message\":\"Method not found\"}}}}", .{id_str});
                         try sendResponse(io, stdout, arena_alloc, resp);
                     }
                 }
             }
         }
     }
+}
+
+test "jsonEscape special and control characters" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const input = "Hello \"world\" \\\n\r\t\x00\x1f";
+    const escaped = try jsonEscape(allocator, input);
+    defer allocator.free(escaped);
+
+    try testing.expectEqualStrings("Hello \\\"world\\\" \\\\\\n\\r\\t\\u0000\\u001f", escaped);
+}
+
+test "idToString integer, string, and null" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const id_int = try idToString(allocator, .{ .integer = 42 });
+    defer allocator.free(id_int);
+    try testing.expectEqualStrings("42", id_int);
+
+    const id_str = try idToString(allocator, .{ .string = "req-1" });
+    defer allocator.free(id_str);
+    try testing.expectEqualStrings("\"req-1\"", id_str);
+
+    const id_null = try idToString(allocator, .null);
+    defer allocator.free(id_null);
+    try testing.expectEqualStrings("null", id_null);
 }
