@@ -151,11 +151,7 @@ pub const Hunk = struct {
     diff_lines: std.ArrayList([]const u8),
 };
 
-pub fn getHunkDiff(allocator: Allocator, runner: *const GitRunner, file_path: []const u8, dir_path: []const u8, target_line: usize) !?[]const u8 {
-    const raw_diff = (try runner.run(&.{ "git", "diff", "HEAD", "-U0", "--no-color", file_path }, dir_path)) orelse
-        (try runner.run(&.{ "git", "diff", "-U0", "--no-color", file_path }, dir_path)) orelse return null;
-    defer allocator.free(raw_diff);
-
+pub fn getHunkDiff(allocator: Allocator, raw_diff: []const u8, target_line: usize) !?[]const u8 {
     var hunks: std.ArrayList(Hunk) = .empty;
     defer {
         for (hunks.items) |*h| {
@@ -224,16 +220,50 @@ pub fn getHunkDiff(allocator: Allocator, runner: *const GitRunner, file_path: []
                 allocator.free(dedented);
             }
 
+            var target_idx: ?usize = null;
+            if (n_count > 0) {
+                const offset = target_line - n_start;
+                var plus_count: usize = 0;
+                for (dedented, 0..) |line, i| {
+                    if (line.len > 0 and line[0] == '+') {
+                        if (plus_count == offset) {
+                            target_idx = i;
+                            break;
+                        }
+                        plus_count += 1;
+                    }
+                }
+            } else {
+                target_idx = 0;
+            }
+
+            var start_idx: usize = 0;
+            var end_idx: usize = dedented.len;
+
+            if (dedented.len > 10) {
+                if (target_idx) |t_idx| {
+                    start_idx = if (t_idx > 3) t_idx - 3 else 0;
+                    end_idx = @min(dedented.len, t_idx + 4);
+
+                    while (end_idx - start_idx < 7 and (start_idx > 0 or end_idx < dedented.len)) {
+                        if (start_idx > 0) start_idx -= 1;
+                        if (end_idx < dedented.len and end_idx - start_idx < 7) end_idx += 1;
+                    }
+                }
+            }
+
             var diff_buf: std.ArrayList(u8) = .empty;
             errdefer diff_buf.deinit(allocator);
 
             try diff_buf.appendSlice(allocator, "```diff\n");
-            const max_lines = @min(dedented.len, 20);
-            for (dedented[0..max_lines]) |l| {
+            if (start_idx > 0) {
+                try diff_buf.appendSlice(allocator, "... (more lines)\n");
+            }
+            for (dedented[start_idx..end_idx]) |l| {
                 try diff_buf.appendSlice(allocator, l);
                 try diff_buf.append(allocator, '\n');
             }
-            if (dedented.len > 20) {
+            if (end_idx < dedented.len) {
                 try diff_buf.appendSlice(allocator, "... (more lines)\n");
             }
             try diff_buf.appendSlice(allocator, "```");
@@ -283,9 +313,6 @@ pub fn getStatusAndStats(allocator: Allocator, runner: *const GitRunner, file_pa
 pub fn getGitBlameAndDiff(allocator: Allocator, runner: *const GitRunner, file_path: []const u8, line_no: usize) !?[]const u8 {
     const dir_path = std.fs.path.dirname(file_path) orelse return null;
 
-    const hunk_diff = try getHunkDiff(allocator, runner, file_path, dir_path, line_no);
-    defer if (hunk_diff) |hd| allocator.free(hd);
-
     const line_arg = try std.fmt.allocPrint(allocator, "{d},{d}", .{ line_no, line_no });
     defer allocator.free(line_arg);
 
@@ -298,6 +325,8 @@ pub fn getGitBlameAndDiff(allocator: Allocator, runner: *const GitRunner, file_p
     var author_time: []const u8 = "";
     var summary: []const u8 = "";
     var prev_sha: []const u8 = "";
+    var orig_line: usize = line_no;
+    var orig_filename: []const u8 = "";
 
     if (blame_out) |raw_blame| {
         var lines_it = std.mem.splitScalar(u8, raw_blame, '\n');
@@ -306,6 +335,9 @@ pub fn getGitBlameAndDiff(allocator: Allocator, runner: *const GitRunner, file_p
                 var words = std.mem.splitScalar(u8, line, ' ');
                 if (words.next()) |s| {
                     sha = s[0..@min(8, s.len)];
+                }
+                if (words.next()) |orig_line_str| {
+                    orig_line = std.fmt.parseInt(usize, orig_line_str, 10) catch line_no;
                 }
             } else if (std.mem.startsWith(u8, line, "author ")) {
                 author = std.mem.trim(u8, line[7..], " \t\r\n");
@@ -331,22 +363,44 @@ pub fn getGitBlameAndDiff(allocator: Allocator, runner: *const GitRunner, file_p
                 if (parts.next()) |psha| {
                     prev_sha = psha[0..@min(8, psha.len)];
                 }
+            } else if (std.mem.startsWith(u8, line, "filename ")) {
+                orig_filename = std.mem.trim(u8, line[9..], " \t\r\n");
             }
+        }
+    }
+
+    const is_uncommitted = std.mem.startsWith(u8, sha, "0000000") or std.mem.eql(u8, author, "Not Committed Yet");
+
+    var hunk_diff: ?[]const u8 = null;
+    defer if (hunk_diff) |hd| allocator.free(hd);
+
+    if (is_uncommitted) {
+        if (try runner.run(&.{ "git", "diff", "HEAD", "-U0", "--no-color", file_path }, dir_path) orelse
+            try runner.run(&.{ "git", "diff", "-U0", "--no-color", file_path }, dir_path)) |raw_diff|
+        {
+            defer allocator.free(raw_diff);
+            hunk_diff = try getHunkDiff(allocator, raw_diff, line_no);
+        }
+    } else if (sha.len > 0) {
+        var target_file: []const u8 = file_path;
+        var needs_free = false;
+        if (orig_filename.len > 0) {
+            target_file = try std.fmt.allocPrint(allocator, ":/{s}", .{orig_filename});
+            needs_free = true;
+        }
+        defer if (needs_free) allocator.free(target_file);
+
+        if (try runner.run(&.{ "git", "show", "-U0", "--no-color", sha, "--", target_file }, dir_path)) |raw_diff| {
+            defer allocator.free(raw_diff);
+            hunk_diff = try getHunkDiff(allocator, raw_diff, orig_line);
         }
     }
 
     var result_list: std.ArrayList(u8) = .empty;
     errdefer result_list.deinit(allocator);
 
-    const is_uncommitted = std.mem.startsWith(u8, sha, "0000000") or std.mem.eql(u8, author, "Not Committed Yet");
-
     if (is_uncommitted) {
-        const file_stat = try getStatusAndStats(allocator, runner, file_path, dir_path);
-        defer allocator.free(file_stat);
-
-        try result_list.appendSlice(allocator, "`");
-        try result_list.appendSlice(allocator, file_stat);
-        try result_list.appendSlice(allocator, "`\n");
+        try result_list.appendSlice(allocator, "`Uncommitted Changes • You`\n");
 
         if (hunk_diff) |hd| {
             try result_list.appendSlice(allocator, hd);
