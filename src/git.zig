@@ -1,25 +1,26 @@
 const std = @import("std");
+const diff = @import("diff.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 pub const GitRunner = struct {
-    allocator: Allocator,
     io: Io,
 
-    pub fn init(allocator: Allocator, io: Io) GitRunner {
-        return .{ .allocator = allocator, .io = io };
+    pub fn init(io: Io) GitRunner {
+        return .{ .io = io };
     }
 
-    pub fn run(self: *const GitRunner, argv: []const []const u8, cwd: ?[]const u8) !?[]u8 {
+    pub fn run(self: *const GitRunner, allocator: Allocator, argv: []const []const u8, cwd: ?[]const u8) !?[]u8 {
         var child = std.process.spawn(self.io, .{
             .argv = argv,
             .cwd = if (cwd) |c| .{ .path = c } else .inherit,
+            .stdin = .ignore,
             .stdout = .pipe,
             .stderr = .ignore,
         }) catch return null;
 
         var stdout_list: std.ArrayList(u8) = .empty;
-        errdefer stdout_list.deinit(self.allocator);
+        defer stdout_list.deinit(allocator);
 
         if (child.stdout) |file| {
             var buf: [4096]u8 = undefined;
@@ -27,25 +28,17 @@ pub const GitRunner = struct {
             while (true) {
                 const amt = file.readStreaming(self.io, &iov) catch break;
                 if (amt == 0) break;
-                try stdout_list.appendSlice(self.allocator, buf[0..amt]);
+                try stdout_list.appendSlice(allocator, buf[0..amt]);
             }
         }
 
         const term = child.wait(self.io) catch return null;
         switch (term) {
-            .exited => |code| {
-                if (code != 0) {
-                    stdout_list.deinit(self.allocator);
-                    return null;
-                }
-            },
-            else => {
-                stdout_list.deinit(self.allocator);
-                return null;
-            },
+            .exited => |code| if (code != 0) return null,
+            else => return null,
         }
 
-        return try stdout_list.toOwnedSlice(self.allocator);
+        return try stdout_list.toOwnedSlice(allocator);
     }
 };
 
@@ -143,7 +136,48 @@ pub fn dedentDiff(allocator: Allocator, lines: []const []const u8) ![]const []co
     return try result.toOwnedSlice(allocator);
 }
 
-pub const Hunk = struct {
+pub fn formatDiffBlock(allocator: Allocator, lines: []const []const u8, target_idx: ?usize) ![]const u8 {
+    const dedented = try dedentDiff(allocator, lines);
+    defer {
+        for (dedented) |d| allocator.free(d);
+        allocator.free(dedented);
+    }
+
+    var start_idx: usize = 0;
+    var end_idx: usize = dedented.len;
+
+    if (dedented.len > 10) {
+        if (target_idx) |t_idx| {
+            start_idx = if (t_idx > 3) t_idx - 3 else 0;
+            end_idx = @min(dedented.len, t_idx + 4);
+
+            while (end_idx - start_idx < 7 and (start_idx > 0 or end_idx < dedented.len)) {
+                if (start_idx > 0) start_idx -= 1;
+                if (end_idx < dedented.len and end_idx - start_idx < 7) end_idx += 1;
+            }
+        }
+    }
+
+    var diff_buf: std.ArrayList(u8) = .empty;
+    errdefer diff_buf.deinit(allocator);
+
+    try diff_buf.appendSlice(allocator, "```diff\n");
+    if (start_idx > 0) {
+        try diff_buf.appendSlice(allocator, "... (more lines)\n");
+    }
+    for (dedented[start_idx..end_idx]) |l| {
+        try diff_buf.appendSlice(allocator, l);
+        try diff_buf.append(allocator, '\n');
+    }
+    if (end_idx < dedented.len) {
+        try diff_buf.appendSlice(allocator, "... (more lines)\n");
+    }
+    try diff_buf.appendSlice(allocator, "```");
+
+    return try diff_buf.toOwnedSlice(allocator);
+}
+
+pub const PatchHunk = struct {
     old_start: usize,
     old_count: usize,
     new_start: usize,
@@ -152,7 +186,7 @@ pub const Hunk = struct {
 };
 
 pub fn getHunkDiff(allocator: Allocator, raw_diff: []const u8, target_line: usize) !?[]const u8 {
-    var hunks: std.ArrayList(Hunk) = .empty;
+    var hunks: std.ArrayList(PatchHunk) = .empty;
     defer {
         for (hunks.items) |*h| {
             for (h.diff_lines.items) |l| allocator.free(l);
@@ -214,17 +248,11 @@ pub fn getHunkDiff(allocator: Allocator, raw_diff: []const u8, target_line: usiz
         const n_end = if (n_count > 0) n_start + n_count - 1 else n_start;
 
         if ((n_count == 0 and target_line == n_start) or (n_count > 0 and target_line >= n_start and target_line <= n_end)) {
-            const dedented = try dedentDiff(allocator, hunk.diff_lines.items);
-            defer {
-                for (dedented) |d| allocator.free(d);
-                allocator.free(dedented);
-            }
-
             var target_idx: ?usize = null;
             if (n_count > 0) {
                 const offset = target_line - n_start;
                 var plus_count: usize = 0;
-                for (dedented, 0..) |line, i| {
+                for (hunk.diff_lines.items, 0..) |line, i| {
                     if (line.len > 0 and line[0] == '+') {
                         if (plus_count == offset) {
                             target_idx = i;
@@ -237,225 +265,171 @@ pub fn getHunkDiff(allocator: Allocator, raw_diff: []const u8, target_line: usiz
                 target_idx = 0;
             }
 
-            var start_idx: usize = 0;
-            var end_idx: usize = dedented.len;
-
-            if (dedented.len > 10) {
-                if (target_idx) |t_idx| {
-                    start_idx = if (t_idx > 3) t_idx - 3 else 0;
-                    end_idx = @min(dedented.len, t_idx + 4);
-
-                    while (end_idx - start_idx < 7 and (start_idx > 0 or end_idx < dedented.len)) {
-                        if (start_idx > 0) start_idx -= 1;
-                        if (end_idx < dedented.len and end_idx - start_idx < 7) end_idx += 1;
-                    }
-                }
-            }
-
-            var diff_buf: std.ArrayList(u8) = .empty;
-            errdefer diff_buf.deinit(allocator);
-
-            try diff_buf.appendSlice(allocator, "```diff\n");
-            if (start_idx > 0) {
-                try diff_buf.appendSlice(allocator, "... (more lines)\n");
-            }
-            for (dedented[start_idx..end_idx]) |l| {
-                try diff_buf.appendSlice(allocator, l);
-                try diff_buf.append(allocator, '\n');
-            }
-            if (end_idx < dedented.len) {
-                try diff_buf.appendSlice(allocator, "... (more lines)\n");
-            }
-            try diff_buf.appendSlice(allocator, "```");
-
-            return try diff_buf.toOwnedSlice(allocator);
+            return try formatDiffBlock(allocator, hunk.diff_lines.items, target_idx);
         }
     }
 
     return null;
 }
 
-pub fn getStatusAndStats(allocator: Allocator, runner: *const GitRunner, file_path: []const u8, dir_path: []const u8) ![]const u8 {
-    const fname = std.fs.path.basename(file_path);
-    var status_buf: [4]u8 = undefined;
-    var status_code: []const u8 = "M";
-    var added: usize = 0;
-    var deleted: usize = 0;
+pub const BlameInfo = struct {
+    sha: []const u8 = "",
+    orig_line: usize = 0,
+    author: []const u8 = "",
+    author_time: i64 = 0,
+    summary: []const u8 = "",
+    filename: []const u8 = "",
 
-    if (try runner.run(&.{ "git", "status", "--porcelain", file_path }, dir_path)) |st| {
-        defer allocator.free(st);
-        const trimmed = std.mem.trim(u8, st, " \t\r\n");
-        if (trimmed.len >= 1) {
-            const code_slice = std.mem.trim(u8, trimmed[0..@min(2, trimmed.len)], " ");
-            const len = @min(code_slice.len, status_buf.len);
-            @memcpy(status_buf[0..len], code_slice[0..len]);
-            status_code = status_buf[0..len];
+    fn shortSha(self: BlameInfo) []const u8 {
+        return self.sha[0..@min(8, self.sha.len)];
+    }
+};
+
+pub fn parseBlame(porcelain: []const u8) ?BlameInfo {
+    var lines = std.mem.splitScalar(u8, porcelain, '\n');
+    var words = std.mem.splitScalar(u8, lines.next() orelse return null, ' ');
+
+    var info: BlameInfo = .{};
+    info.sha = words.next() orelse return null;
+    info.orig_line = std.fmt.parseInt(usize, words.next() orelse return null, 10) catch return null;
+
+    while (lines.next()) |line| {
+        if (std.mem.cutPrefix(u8, line, "author ")) |v| {
+            info.author = v;
+        } else if (std.mem.cutPrefix(u8, line, "author-time ")) |v| {
+            info.author_time = std.fmt.parseInt(i64, v, 10) catch 0;
+        } else if (std.mem.cutPrefix(u8, line, "summary ")) |v| {
+            info.summary = v;
+        } else if (std.mem.cutPrefix(u8, line, "filename ")) |v| {
+            info.filename = v;
         }
     }
-
-    const numstat_raw = (try runner.run(&.{ "git", "diff", "HEAD", "--numstat", file_path }, dir_path)) orelse
-        (try runner.run(&.{ "git", "diff", "--numstat", file_path }, dir_path));
-
-    if (numstat_raw) |numstat| {
-        defer allocator.free(numstat);
-        var parts = std.mem.splitScalar(u8, std.mem.trim(u8, numstat, " \t\r\n"), '\t');
-        if (parts.next()) |a_str| {
-            if (parts.next()) |d_str| {
-                added = std.fmt.parseInt(usize, a_str, 10) catch 0;
-                deleted = std.fmt.parseInt(usize, d_str, 10) catch 0;
-            }
-        }
-    }
-
-    return try std.fmt.allocPrint(allocator, "{s} {s} (+{d}/-{d})", .{ status_code, fname, added, deleted });
+    return info;
 }
 
-pub fn getGitBlameAndDiff(allocator: Allocator, runner: *const GitRunner, file_path: []const u8, line_no: usize) !?[]const u8 {
-    const dir_path = std.fs.path.dirname(file_path) orelse return null;
+fn formatDate(buf: *[16]u8, timestamp: i64) []const u8 {
+    if (timestamp <= 0) return "";
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+    }) catch "";
+}
 
-    const line_arg = try std.fmt.allocPrint(allocator, "{d},{d}", .{ line_no, line_no });
-    defer allocator.free(line_arg);
-
-    const blame_out = try runner.run(&.{ "git", "blame", "-L", line_arg, "--porcelain", file_path }, dir_path);
-    defer if (blame_out) |b| allocator.free(b);
-
-    var sha: []const u8 = "";
-    var author: []const u8 = "";
+fn appendCommitLine(out: *std.ArrayList(u8), arena: Allocator, label: []const u8, info: BlameInfo) !void {
+    try out.print(arena, "`{s}: {s} • {s}", .{ label, info.shortSha(), info.author });
     var date_buf: [16]u8 = undefined;
-    var author_time: []const u8 = "";
-    var summary: []const u8 = "";
-    var prev_sha: []const u8 = "";
-    var orig_line: usize = line_no;
-    var orig_filename: []const u8 = "";
+    const date = formatDate(&date_buf, info.author_time);
+    if (date.len > 0) try out.print(arena, " • {s}", .{date});
+    try out.append(arena, '`');
 
-    if (blame_out) |raw_blame| {
-        var lines_it = std.mem.splitScalar(u8, raw_blame, '\n');
-        while (lines_it.next()) |line| {
-            if (sha.len == 0 and line.len > 0) {
-                var words = std.mem.splitScalar(u8, line, ' ');
-                if (words.next()) |s| {
-                    sha = s[0..@min(8, s.len)];
-                }
-                if (words.next()) |orig_line_str| {
-                    orig_line = std.fmt.parseInt(usize, orig_line_str, 10) catch line_no;
-                }
-            } else if (std.mem.startsWith(u8, line, "author ")) {
-                author = std.mem.trim(u8, line[7..], " \t\r\n");
-            } else if (std.mem.startsWith(u8, line, "author-time ")) {
-                const ts_str = std.mem.trim(u8, line[12..], " \t\r\n");
-                const ts = std.fmt.parseInt(i64, ts_str, 10) catch 0;
-                if (ts > 0) {
-                    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
-                    const epoch_day = epoch_seconds.getEpochDay();
-                    const year_day = epoch_day.calculateYearDay();
-                    const month_day = year_day.calculateMonthDay();
-                    author_time = std.fmt.bufPrint(&date_buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
-                        year_day.year,
-                        month_day.month.numeric(),
-                        month_day.day_index + 1,
-                    }) catch "";
-                }
-            } else if (std.mem.startsWith(u8, line, "summary ")) {
-                summary = std.mem.trim(u8, line[8..], " \t\r\n");
-            } else if (std.mem.startsWith(u8, line, "previous ")) {
-                var parts = std.mem.splitScalar(u8, line, ' ');
-                _ = parts.next();
-                if (parts.next()) |psha| {
-                    prev_sha = psha[0..@min(8, psha.len)];
-                }
-            } else if (std.mem.startsWith(u8, line, "filename ")) {
-                orig_filename = std.mem.trim(u8, line[9..], " \t\r\n");
-            }
+    const summary = try cleanSummary(arena, info.summary);
+    if (summary.len > 0) try out.print(arena, "  \n  ↳ *{s}*", .{summary});
+}
+
+const RepoFile = struct {
+    runner: *const GitRunner,
+    dir: []const u8,
+    name: []const u8,
+
+    fn headContent(self: RepoFile, arena: Allocator) !?[]u8 {
+        const spec = try std.fmt.allocPrint(arena, "HEAD:./{s}", .{self.name});
+        return try self.runner.run(arena, &.{ "git", "cat-file", "blob", spec }, self.dir);
+    }
+
+    fn blameAtHead(self: RepoFile, arena: Allocator, old_line: usize) !?BlameInfo {
+        const range = try std.fmt.allocPrint(arena, "{d},{d}", .{ old_line + 1, old_line + 1 });
+        const out = try self.runner.run(arena, &.{ "git", "blame", "--porcelain", "-L", range, "HEAD", "--", self.name }, self.dir) orelse return null;
+        return parseBlame(out);
+    }
+};
+
+pub fn buildHover(arena: Allocator, runner: *const GitRunner, file_path: []const u8, text: []const u8, line: usize) !?[]const u8 {
+    const file: RepoFile = .{
+        .runner = runner,
+        .dir = std.fs.path.dirname(file_path) orelse return null,
+        .name = std.fs.path.basename(file_path),
+    };
+
+    const head_text = try file.headContent(arena) orelse return null;
+    const old_lines = try diff.splitLines(arena, head_text);
+    const new_lines = try diff.splitLines(arena, text);
+    const hunks = try diff.diffLines(arena, old_lines, new_lines);
+
+    if (diff.findHunk(hunks, old_lines, new_lines, line)) |hunk| {
+        return try localChangeHover(arena, file, hunks, hunk, old_lines, new_lines, line);
+    }
+
+    const old_line = diff.oldLineFor(hunks, line);
+    if (old_line >= old_lines.len) return null;
+    return try committedHover(arena, file, old_line);
+}
+
+fn localChangeHover(
+    arena: Allocator,
+    file: RepoFile,
+    hunks: []const diff.Hunk,
+    hunk: diff.Hunk,
+    old_lines: []const []const u8,
+    new_lines: []const []const u8,
+    line: usize,
+) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+
+    var added: usize = 0;
+    var deleted: usize = 0;
+    for (hunks) |h| {
+        added += h.new_count;
+        deleted += h.old_count;
+    }
+    try out.print(arena, "`M {s} (+{d}/-{d})`\n", .{ file.name, added, deleted });
+
+    var diff_lines: std.ArrayList([]const u8) = .empty;
+    for (old_lines[hunk.old_start..][0..hunk.old_count]) |l| {
+        try diff_lines.append(arena, try std.fmt.allocPrint(arena, "-{s}", .{l}));
+    }
+    for (new_lines[hunk.new_start..][0..hunk.new_count]) |l| {
+        try diff_lines.append(arena, try std.fmt.allocPrint(arena, "+{s}", .{l}));
+    }
+    const offset = line - hunk.new_start;
+    const target_idx = if (hunk.new_count == 0) 0 else hunk.old_count + offset;
+    try out.appendSlice(arena, try formatDiffBlock(arena, diff_lines.items, target_idx));
+
+    if (hunk.old_count > 0) {
+        const old_line = hunk.old_start + @min(offset, hunk.old_count - 1);
+        if (try file.blameAtHead(arena, old_line)) |info| {
+            try out.append(arena, '\n');
+            try appendCommitLine(&out, arena, "Prev", info);
         }
     }
 
-    const is_uncommitted = std.mem.startsWith(u8, sha, "0000000") or std.mem.eql(u8, author, "Not Committed Yet");
-
-    var hunk_diff: ?[]const u8 = null;
-    defer if (hunk_diff) |hd| allocator.free(hd);
-
-    if (is_uncommitted) {
-        if (try runner.run(&.{ "git", "diff", "HEAD", "-U0", "--no-color", file_path }, dir_path) orelse
-            try runner.run(&.{ "git", "diff", "-U0", "--no-color", file_path }, dir_path)) |raw_diff|
-        {
-            defer allocator.free(raw_diff);
-            hunk_diff = try getHunkDiff(allocator, raw_diff, line_no);
-        }
-    } else if (sha.len > 0) {
-        var target_file: []const u8 = file_path;
-        var needs_free = false;
-        if (orig_filename.len > 0) {
-            target_file = try std.fmt.allocPrint(allocator, ":/{s}", .{orig_filename});
-            needs_free = true;
-        }
-        defer if (needs_free) allocator.free(target_file);
-
-        if (try runner.run(&.{ "git", "show", "-U0", "--no-color", sha, "--", target_file }, dir_path)) |raw_diff| {
-            defer allocator.free(raw_diff);
-            hunk_diff = try getHunkDiff(allocator, raw_diff, orig_line);
+    if (hunk.new_count == 0 and line < new_lines.len) {
+        if (try file.blameAtHead(arena, hunk.old_start + hunk.old_count)) |info| {
+            try out.appendSlice(arena, "\n\n");
+            try appendCommitLine(&out, arena, "Blame", info);
         }
     }
 
-    var result_list: std.ArrayList(u8) = .empty;
-    errdefer result_list.deinit(allocator);
+    return try out.toOwnedSlice(arena);
+}
 
-    if (is_uncommitted) {
-        try result_list.appendSlice(allocator, "`Uncommitted Changes • You`\n");
+fn committedHover(arena: Allocator, file: RepoFile, old_line: usize) !?[]const u8 {
+    const info = try file.blameAtHead(arena, old_line) orelse return null;
 
-        if (hunk_diff) |hd| {
-            try result_list.appendSlice(allocator, hd);
-            try result_list.appendSlice(allocator, "\n");
-        }
+    var out: std.ArrayList(u8) = .empty;
 
-        if (prev_sha.len > 0) {
-            const prev_out = try runner.run(&.{ "git", "show", "-s", "--format=%an%x00%ar%x00%s", prev_sha }, dir_path);
-            if (prev_out) |po| {
-                defer allocator.free(po);
-                var parts = std.mem.splitScalar(u8, std.mem.trim(u8, po, " \t\r\n"), 0);
-                const p_author = parts.next() orelse "";
-                const p_time = parts.next() orelse "";
-                const p_raw_sum = parts.rest();
-                const p_sum = try cleanSummary(allocator, p_raw_sum);
-                defer allocator.free(p_sum);
-
-                const prev_str = try std.fmt.allocPrint(allocator, "• Prev: `{s}` • {s} ({s})", .{ prev_sha, p_author, p_time });
-                defer allocator.free(prev_str);
-                try result_list.appendSlice(allocator, prev_str);
-
-                if (p_sum.len > 0) {
-                    try result_list.appendSlice(allocator, "  \n  ↳ *");
-                    try result_list.appendSlice(allocator, p_sum);
-                    try result_list.appendSlice(allocator, "*");
-                }
-            }
-        }
-    } else if (sha.len > 0) {
-        if (hunk_diff) |hd| {
-            try result_list.appendSlice(allocator, hd);
-            try result_list.appendSlice(allocator, "\n");
-        }
-
-        try result_list.appendSlice(allocator, "`Blame: ");
-        try result_list.appendSlice(allocator, sha);
-        try result_list.appendSlice(allocator, " • ");
-        try result_list.appendSlice(allocator, author);
-        if (author_time.len > 0) {
-            try result_list.appendSlice(allocator, " • ");
-            try result_list.appendSlice(allocator, author_time);
-        }
-        try result_list.appendSlice(allocator, "`");
-
-        const clean_sum = try cleanSummary(allocator, summary);
-        defer allocator.free(clean_sum);
-        if (clean_sum.len > 0) {
-            try result_list.appendSlice(allocator, "  \n  ↳ *");
-            try result_list.appendSlice(allocator, clean_sum);
-            try result_list.appendSlice(allocator, "*");
+    const commit_path = try std.fmt.allocPrint(arena, ":/{s}", .{info.filename});
+    if (try file.runner.run(arena, &.{ "git", "show", "-U0", "--no-color", info.sha, "--", commit_path }, file.dir)) |patch| {
+        if (try getHunkDiff(arena, patch, info.orig_line)) |block| {
+            try out.print(arena, "{s}\n", .{block});
         }
     }
 
-    if (result_list.items.len == 0) return null;
-    return try result_list.toOwnedSlice(allocator);
+    try appendCommitLine(&out, arena, "Blame", info);
+    return try out.toOwnedSlice(arena);
 }
 
 test "urlDecode Unix and Windows paths" {
@@ -513,4 +487,25 @@ test "dedentDiff indentation and empty lines" {
     try testing.expectEqualStrings("+ pub fn newFn() void {", dedented[1]);
     try testing.expectEqualStrings("+     doSomething();", dedented[2]);
     try testing.expectEqualStrings("+ }", dedented[3]);
+}
+
+test "parseBlame reads porcelain header fields" {
+    const testing = std.testing;
+
+    const porcelain =
+        \\d6dcc2d8db74b1d5b2c3c42beb2cd389f8659d20 7 3 1
+        \\author Tester
+        \\author-mail <t@t>
+        \\author-time 1792059801
+        \\summary add sub
+        \\filename sub/b.txt
+    ;
+    const info = parseBlame(porcelain) orelse return error.TestUnexpectedResult;
+
+    try testing.expectEqualStrings("d6dcc2d8", info.shortSha());
+    try testing.expectEqual(7, info.orig_line);
+    try testing.expectEqualStrings("Tester", info.author);
+    try testing.expectEqual(1792059801, info.author_time);
+    try testing.expectEqualStrings("add sub", info.summary);
+    try testing.expectEqualStrings("sub/b.txt", info.filename);
 }

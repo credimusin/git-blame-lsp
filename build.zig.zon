@@ -2,7 +2,7 @@
     .name = .git_blame_lsp,
     .version = "0.1.0",
     .fingerprint = 0x74f7f92e75f422a6,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",
