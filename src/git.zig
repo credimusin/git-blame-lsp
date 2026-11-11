@@ -83,7 +83,27 @@ pub fn cleanSummary(allocator: Allocator, text: []const u8) ![]const u8 {
     if (std.mem.startsWith(u8, trimmed, prefix)) {
         return try std.fmt.allocPrint(allocator, "PR {s}", .{trimmed[prefix.len..]});
     }
+    if (parseMerge(trimmed)) |merge| {
+        return try std.fmt.allocPrint(allocator, "{s} {s} → {s}", .{ merge.label, merge.source, merge.target });
+    }
     return try allocator.dupe(u8, trimmed);
+}
+
+const Merge = struct {
+    label: []const u8,
+    source: []const u8,
+    target: []const u8,
+};
+
+fn parseMerge(summary: []const u8) ?Merge {
+    const rest = std.mem.cutPrefix(u8, summary, "Merge branch '") orelse
+        std.mem.cutPrefix(u8, summary, "Merge remote-tracking branch '") orelse return null;
+    const source, const tail = std.mem.cut(u8, rest, "'") orelse return null;
+    _, const quoted_target = std.mem.cut(u8, tail, " into ") orelse return null;
+
+    const target = std.mem.trim(u8, quoted_target, "'");
+    const is_gitlab = target.len != quoted_target.len;
+    return .{ .label = if (is_gitlab) "MR" else "Merge", .source = source, .target = target };
 }
 
 pub fn dedentDiff(allocator: Allocator, lines: []const []const u8) ![]const []const u8 {
@@ -362,8 +382,21 @@ const RepoFile = struct {
 
     fn blameAtHead(self: RepoFile, arena: Allocator, old_line: usize) !?BlameInfo {
         const range = try std.fmt.allocPrint(arena, "{d},{d}", .{ old_line + 1, old_line + 1 });
-        const out = try self.runner.run(arena, &.{ "git", "-c", "core.quotePath=false", "blame", "--porcelain", "-L", range, "HEAD", "--", self.name }, self.dir) orelse return null;
+        const out = try self.blame(arena, range, .project_file) orelse
+            try self.blame(arena, range, .none) orelse return null;
         return parseBlame(out);
+    }
+
+    const IgnoreRevs = enum { project_file, none };
+
+    fn blame(self: RepoFile, arena: Allocator, range: []const u8, ignore_revs: IgnoreRevs) !?[]u8 {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ "git", "-c", "core.quotePath=false" });
+        if (ignore_revs == .project_file) {
+            try argv.appendSlice(arena, &.{ "-c", "blame.ignoreRevsFile=:(optional).git-blame-ignore-revs" });
+        }
+        try argv.appendSlice(arena, &.{ "blame", "--porcelain", "-L", range, "HEAD", "--", self.name });
+        return try self.runner.run(arena, argv.items, self.dir);
     }
 
     fn commitPatch(self: RepoFile, arena: Allocator, info: BlameInfo) !?[]u8 {
@@ -478,17 +511,50 @@ test "urlDecode Unix and Windows paths" {
     try testing.expectEqualStrings("C:/Users/Developer/main.zig", win_path);
 }
 
-test "cleanSummary PR and normal messages" {
+test "cleanSummary shortens merge subjects" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const pr_msg = try cleanSummary(allocator, "Merge pull request #12 from branch");
-    defer allocator.free(pr_msg);
-    try testing.expectEqualStrings("PR #12 from branch", pr_msg);
+    const cases = [_]struct { name: []const u8, summary: []const u8, cleaned: []const u8 }{
+        .{
+            .name = "plain message is trimmed",
+            .summary = "  Fix issue with LSP hover  \n",
+            .cleaned = "Fix issue with LSP hover",
+        },
+        .{
+            .name = "github pull request",
+            .summary = "Merge pull request #12 from branch",
+            .cleaned = "PR #12 from branch",
+        },
+        .{
+            .name = "gitlab merge request",
+            .summary = "Merge branch 'feature/init' into 'main'",
+            .cleaned = "MR feature/init → main",
+        },
+        .{
+            .name = "local merge pulled from a url",
+            .summary = "Merge branch 'main' of https://example.com/team/app into feature/init",
+            .cleaned = "Merge main → feature/init",
+        },
+        .{
+            .name = "remote-tracking branch",
+            .summary = "Merge remote-tracking branch 'origin/main' into feature/init",
+            .cleaned = "Merge origin/main → feature/init",
+        },
+        .{
+            .name = "merge without a target stays as is",
+            .summary = "Merge branch 'feature/init'",
+            .cleaned = "Merge branch 'feature/init'",
+        },
+    };
 
-    const normal_msg = try cleanSummary(allocator, "  Fix issue with LSP hover  \n");
-    defer allocator.free(normal_msg);
-    try testing.expectEqualStrings("Fix issue with LSP hover", normal_msg);
+    for (cases) |case| {
+        const cleaned = try cleanSummary(allocator, case.summary);
+        defer allocator.free(cleaned);
+
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        try testing.expectEqualStrings(case.cleaned, cleaned);
+    }
 }
 
 test "dedentDiff indentation and empty lines" {
