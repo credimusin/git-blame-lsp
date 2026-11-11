@@ -173,19 +173,33 @@ pub fn findHunk(hunks: []const Hunk, old: []const []const u8, new: []const []con
     for (hunks) |h| {
         if (h.coversLine(line)) return h;
     }
-    for (hunks) |h| {
-        if (slideTo(h, old, new, line)) |slid| return slid;
+    for (hunks, 0..) |h, i| {
+        const room: OldRange = .{
+            .start = if (i > 0) hunks[i - 1].old_start + hunks[i - 1].old_count else 0,
+            .end = if (i + 1 < hunks.len) hunks[i + 1].old_start else old.len,
+        };
+        if (slideTo(h, room, old, new, line)) |slid| return slid;
     }
     return null;
 }
 
-fn slideTo(hunk: Hunk, old: []const []const u8, new: []const []const u8, line: usize) ?Hunk {
+const OldRange = struct {
+    start: usize,
+    end: usize,
+
+    fn contains(self: OldRange, h: Hunk) bool {
+        return h.old_start >= self.start and h.old_start + h.old_count <= self.end;
+    }
+};
+
+fn slideTo(hunk: Hunk, room: OldRange, old: []const []const u8, new: []const []const u8, line: usize) ?Hunk {
     if (!hunk.isPure()) return null;
 
     var h = hunk;
     while (!h.coversLine(line)) {
         const next = if (line < h.new_start) slideUp(h, old, new) else slideDown(h, old, new);
         h = next orelse return null;
+        if (!room.contains(h)) return null;
     }
     return h;
 }
@@ -340,6 +354,13 @@ test "findHunk matches the line Helix marks" {
             .new = &.{ "x", "", "", "y" },
             .line = 1,
             .hunk = .{ .old_start = 1, .old_count = 0, .new_start = 1, .new_count = 1 },
+        },
+        .{
+            .name = "slide stops at a neighbouring hunk",
+            .old = &.{ "}", "b", "}", "" },
+            .new = &.{ "}", "}", "}", "", "a" },
+            .line = 0,
+            .hunk = null,
         },
         .{
             .name = "modification does not slide",
