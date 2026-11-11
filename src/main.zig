@@ -137,7 +137,10 @@ fn sendResult(server: *Server, arena: Allocator, id: Value, result_json: []const
     try sendResponse(server.io, server.stdout, arena, resp);
 }
 
-pub fn jsonEscape(allocator: Allocator, text: []const u8) ![]const u8 {
+pub fn jsonEscape(allocator: Allocator, raw: []const u8) ![]const u8 {
+    const text = try std.fmt.allocPrint(allocator, "{f}", .{std.unicode.fmtUtf8(raw)});
+    defer allocator.free(text);
+
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(allocator);
 
@@ -302,6 +305,16 @@ test "jsonEscape special and control characters" {
     defer allocator.free(escaped);
 
     try testing.expectEqualStrings("Hello \\\"world\\\" \\\\\\n\\r\\t\\u0000\\u001f", escaped);
+}
+
+test "jsonEscape replaces invalid UTF-8" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const escaped = try jsonEscape(allocator, "// \xef\xf0 ok \xd0\xbf");
+    defer allocator.free(escaped);
+
+    try testing.expectEqualStrings("// \u{FFFD}\u{FFFD} ok \u{43f}", escaped);
 }
 
 test "idToString integer, string, and null" {

@@ -15,7 +15,7 @@ Written in **Zig** with zero external dependencies.
 - **Previous Commit Resolution**: For changed or deleted lines, shows the commit that last touched the old version of the line: author, date, and message.
 - **Clean PR Summaries**: Automatically simplifies merge messages (e.g. `Merge pull request #12 ...` → `PR #12 ...`).
 - **Standard Git Blame**: For committed lines, shows commit SHA, author name, timestamp, and summary.
-- **Native & Ultra Lightweight**: Compiles into a single standalone static binary (~600 KB stripped) with sub-millisecond response times (< 1ms).
+- **Native & Ultra Lightweight**: Compiles into a single standalone static binary (~600 KB stripped) and answers a hover in tens of milliseconds (three short `git` calls).
 
 ---
 

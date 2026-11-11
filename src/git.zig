@@ -277,13 +277,28 @@ pub const BlameInfo = struct {
     orig_line: usize = 0,
     author: []const u8 = "",
     author_time: i64 = 0,
+    author_tz_offset: i64 = 0,
     summary: []const u8 = "",
     filename: []const u8 = "",
+    previous: ?Previous = null,
+
+    const Previous = struct {
+        sha: []const u8,
+        filename: []const u8,
+    };
 
     fn shortSha(self: BlameInfo) []const u8 {
         return self.sha[0..@min(8, self.sha.len)];
     }
 };
+
+fn tzOffsetSeconds(tz: []const u8) i64 {
+    if (tz.len != 5) return 0;
+    const hours = std.fmt.parseInt(i64, tz[1..3], 10) catch return 0;
+    const minutes = std.fmt.parseInt(i64, tz[3..5], 10) catch return 0;
+    const offset = hours * 3600 + minutes * 60;
+    return if (tz[0] == '-') -offset else offset;
+}
 
 pub fn parseBlame(porcelain: []const u8) ?BlameInfo {
     var lines = std.mem.splitScalar(u8, porcelain, '\n');
@@ -298,8 +313,13 @@ pub fn parseBlame(porcelain: []const u8) ?BlameInfo {
             info.author = v;
         } else if (std.mem.cutPrefix(u8, line, "author-time ")) |v| {
             info.author_time = std.fmt.parseInt(i64, v, 10) catch 0;
+        } else if (std.mem.cutPrefix(u8, line, "author-tz ")) |v| {
+            info.author_tz_offset = tzOffsetSeconds(v);
         } else if (std.mem.cutPrefix(u8, line, "summary ")) |v| {
             info.summary = v;
+        } else if (std.mem.cutPrefix(u8, line, "previous ")) |v| {
+            const space = std.mem.indexOfScalar(u8, v, ' ') orelse continue;
+            info.previous = .{ .sha = v[0..space], .filename = v[space + 1 ..] };
         } else if (std.mem.cutPrefix(u8, line, "filename ")) |v| {
             info.filename = v;
         }
@@ -322,7 +342,7 @@ fn formatDate(buf: *[16]u8, timestamp: i64) []const u8 {
 fn appendCommitLine(out: *std.ArrayList(u8), arena: Allocator, label: []const u8, info: BlameInfo) !void {
     try out.print(arena, "`{s}: {s} • {s}", .{ label, info.shortSha(), info.author });
     var date_buf: [16]u8 = undefined;
-    const date = formatDate(&date_buf, info.author_time);
+    const date = formatDate(&date_buf, info.author_time + info.author_tz_offset);
     if (date.len > 0) try out.print(arena, " • {s}", .{date});
     try out.append(arena, '`');
 
@@ -342,8 +362,18 @@ const RepoFile = struct {
 
     fn blameAtHead(self: RepoFile, arena: Allocator, old_line: usize) !?BlameInfo {
         const range = try std.fmt.allocPrint(arena, "{d},{d}", .{ old_line + 1, old_line + 1 });
-        const out = try self.runner.run(arena, &.{ "git", "blame", "--porcelain", "-L", range, "HEAD", "--", self.name }, self.dir) orelse return null;
+        const out = try self.runner.run(arena, &.{ "git", "-c", "core.quotePath=false", "blame", "--porcelain", "-L", range, "HEAD", "--", self.name }, self.dir) orelse return null;
         return parseBlame(out);
+    }
+
+    fn commitPatch(self: RepoFile, arena: Allocator, info: BlameInfo) !?[]u8 {
+        const previous = info.previous orelse {
+            const path = try std.fmt.allocPrint(arena, ":/{s}", .{info.filename});
+            return try self.runner.run(arena, &.{ "git", "show", "-U0", "--no-color", info.sha, "--", path }, self.dir);
+        };
+        const old_blob = try std.fmt.allocPrint(arena, "{s}:{s}", .{ previous.sha, previous.filename });
+        const new_blob = try std.fmt.allocPrint(arena, "{s}:{s}", .{ info.sha, info.filename });
+        return try self.runner.run(arena, &.{ "git", "diff", "-U0", "--no-color", "--no-ext-diff", old_blob, new_blob }, self.dir);
     }
 };
 
@@ -421,8 +451,7 @@ fn committedHover(arena: Allocator, file: RepoFile, old_line: usize) !?[]const u
 
     var out: std.ArrayList(u8) = .empty;
 
-    const commit_path = try std.fmt.allocPrint(arena, ":/{s}", .{info.filename});
-    if (try file.runner.run(arena, &.{ "git", "show", "-U0", "--no-color", info.sha, "--", commit_path }, file.dir)) |patch| {
+    if (try file.commitPatch(arena, info)) |patch| {
         if (try getHunkDiff(arena, patch, info.orig_line)) |block| {
             try out.print(arena, "{s}\n", .{block});
         }
@@ -497,7 +526,9 @@ test "parseBlame reads porcelain header fields" {
         \\author Tester
         \\author-mail <t@t>
         \\author-time 1792059801
+        \\author-tz -0330
         \\summary add sub
+        \\previous 33ced9388d605860fcc486c99b72950ae5038498 sub/old name.txt
         \\filename sub/b.txt
     ;
     const info = parseBlame(porcelain) orelse return error.TestUnexpectedResult;
@@ -506,6 +537,11 @@ test "parseBlame reads porcelain header fields" {
     try testing.expectEqual(7, info.orig_line);
     try testing.expectEqualStrings("Tester", info.author);
     try testing.expectEqual(1792059801, info.author_time);
+    try testing.expectEqual(-12600, info.author_tz_offset);
     try testing.expectEqualStrings("add sub", info.summary);
     try testing.expectEqualStrings("sub/b.txt", info.filename);
+
+    const previous = info.previous orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("33ced9388d605860fcc486c99b72950ae5038498", previous.sha);
+    try testing.expectEqualStrings("sub/old name.txt", previous.filename);
 }
