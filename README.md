@@ -13,7 +13,8 @@ Written in **Zig** with zero external dependencies.
 - **Smart Auto-Dedenting**: Strips common leading whitespace from diff blocks for clean, readable terminal formatting.
 - **Lazygit-Style File Stats**: Displays file status and modification counters (e.g. `M Controller.php (+4/-1)`).
 - **Previous Commit Resolution**: For changed or deleted lines, shows the commit that last touched the old version of the line: author, date, and message.
-- **Clean PR Summaries**: Automatically simplifies merge messages (e.g. `Merge pull request #12 ...` → `PR #12 ...`).
+- **Clean Merge Summaries**: Shortens merge messages: `Merge pull request #12 ...` → `PR #12 ...`, `Merge branch 'feature' into 'main'` (GitLab) → `MR feature → main`, `Merge branch 'main' into feature` → `Merge main → feature`.
+- **Ignored Revisions**: If the repository root has a `.git-blame-ignore-revs` file, the commits listed there (e.g. mass reformatting) are skipped and the blame shows the previous author of the line. Needs a recent Git (tested on 2.54); with an older Git or a broken file the blame works as usual.
 - **Standard Git Blame**: For committed lines, shows commit SHA, author name, timestamp, and summary.
 - **Native & Ultra Lightweight**: Compiles into a single standalone static binary (~600 KB stripped) and answers a hover in tens of milliseconds (three short `git` calls).
 
